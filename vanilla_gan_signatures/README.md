@@ -58,11 +58,43 @@ Place your signature images in the `data/signatures/train/` directory. Images sh
 
 ### Training
 
-Training scripts will be added to the `src/` directory.
+To train the model, run the training script:
 
-### Generation
+```bash
+# Navigate to the project folder
+cd vanilla_gan_signatures
 
-After training, the Generator can create new synthetic signatures from random noise vectors.
+# Run training
+python src/train_vanilla_gan_signatures.py --data_dir data/signatures/train --epochs 200
+```
+
+**Common Arguments:**
+
+- `--epochs`: Number of training epochs (default: 200)
+- `--batch_size`: Batch size (default: 64)
+- `--image_size`: Target image size (default: 64)
+- `--resume`: Resume from the latest checkpoint
+
+### Generation (Web Interface)
+
+The easiest way to generate signatures is using the included Streamlit web interface.
+
+#### Option 1: Using the Batch Script (Windows)
+
+Double-click `run_app.bat` in the root directory.
+
+#### Option 2: Command Line
+
+```bash
+cd vanilla_gan_signatures
+streamlit run src/app_vanilla_gan_signatures.py
+```
+
+The interface allows you to:
+
+- Generate single or batch signatures
+- Adjust the "noise" seed for reproducibility
+- Download generated signatures as a ZIP file
 
 ## Features
 
