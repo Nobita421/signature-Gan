@@ -18,14 +18,14 @@ pip-delete-this-directory.txt
 *.code-workspace
 
 # Project specific
-vanilla_gan_signatures/runs/
-vanilla_gan_signatures/logs/
-vanilla_gan_signatures/checkpoints/
-vanilla_gan_signatures/samples/
-vanilla_gan_signatures/data/signatures/train/*.png
-vanilla_gan_signatures/data/signatures/train/*.jpg
-vanilla_gan_signatures/data/signatures/train/*.jpeg
-vanilla_gan_signatures/data/processed/
+runs/
+logs/
+checkpoints/
+samples/
+data/signatures/train/*.png
+data/signatures/train/*.jpg
+data/signatures/train/*.jpeg
+data/processed/
 
 # OS generated files
 .DS_Store

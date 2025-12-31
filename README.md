@@ -61,9 +61,6 @@ Place your signature images in the `data/signatures/train/` directory. Images sh
 To train the model, run the training script:
 
 ```bash
-# Navigate to the project folder
-cd vanilla_gan_signatures
-
 # Run training
 python src/train_vanilla_gan_signatures.py --data_dir data/signatures/train --epochs 200
 ```
@@ -86,7 +83,6 @@ Double-click `run_app.bat` in the root directory.
 #### Option 2: Command Line
 
 ```bash
-cd vanilla_gan_signatures
 streamlit run src/app_vanilla_gan_signatures.py
 ```
 
