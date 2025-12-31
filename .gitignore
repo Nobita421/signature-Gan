@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Project specific
+vanilla_gan_signatures/runs/
+vanilla_gan_signatures/logs/
+vanilla_gan_signatures/checkpoints/
+vanilla_gan_signatures/samples/
+vanilla_gan_signatures/data/signatures/train/*.png
+vanilla_gan_signatures/data/signatures/train/*.jpg
+vanilla_gan_signatures/data/signatures/train/*.jpeg
+vanilla_gan_signatures/data/processed/
+
+# OS generated files
+.DS_Store
+Thumbs.db

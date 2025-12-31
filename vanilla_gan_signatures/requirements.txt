@@ -1,0 +1,36 @@
+# Vanilla GAN Signature Generation - Dependencies
+# ================================================
+
+# Deep Learning Framework
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Numerical Computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Image Processing
+Pillow>=9.5.0
+opencv-python>=4.7.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Progress Bars
+tqdm>=4.65.0
+
+# Web Frameworks
+streamlit>=1.22.0
+streamlit-autorefresh>=1.0.1
+fastapi>=0.95.0
+uvicorn>=0.22.0
+
+# Machine Learning Utilities
+scikit-learn>=1.2.0
+
+# GAN Evaluation Metrics
+lpips>=0.1.4
+pytorch-fid>=0.3.0
+
+# Configuration
+pyyaml>=6.0

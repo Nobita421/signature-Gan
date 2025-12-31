@@ -1,0 +1,114 @@
+# Vanilla GAN Signature Model Versions
+# =====================================
+# This file tracks model architecture versions and their configurations
+
+versions:
+  # Baseline Version - Generic Signature Generation
+  VanillaGAN-Sig-v1.0:
+    description: "Baseline model for generic signature generation"
+    status: "active"
+    release_date: "2024-01-01"
+    architecture:
+      type: "Vanilla GAN"
+      generator:
+        latent_dim: 100
+        hidden_layers: [256, 512, 1024]
+        output_activation: "tanh"
+      discriminator:
+        conv_layers: [64, 128, 256, 512]
+        output_activation: "sigmoid"
+    training:
+      image_size: [64, 64]
+      channels: 1
+      epochs: 200
+      batch_size: 64
+      learning_rate:
+        generator: 0.0002
+        discriminator: 0.0002
+      optimizer: "Adam"
+      beta1: 0.5
+    dataset:
+      supported:
+        - "CEDAR"
+        - "GPDS"
+        - "Custom"
+      preprocessing:
+        - "grayscale conversion"
+        - "resize to 64x64"
+        - "normalize to [-1, 1]"
+    performance:
+      fid_score: "~50-80"
+      training_time: "~2-4 hours on GPU"
+    checkpoint_format: "vanilla_gan_epoch_{epoch}.pth"
+
+  # Improved Architecture Placeholder
+  VanillaGAN-Sig-v1.1:
+    description: "Improved architecture with better stability"
+    status: "planned"
+    release_date: "TBD"
+    improvements:
+      - "Spectral normalization in discriminator"
+      - "Progressive growing training"
+      - "Improved batch normalization"
+      - "Gradient penalty (WGAN-GP style)"
+    architecture:
+      type: "Improved Vanilla GAN"
+      generator:
+        latent_dim: 128
+        hidden_layers: [256, 512, 1024, 2048]
+        normalization: "batch_norm"
+        output_activation: "tanh"
+      discriminator:
+        conv_layers: [64, 128, 256, 512, 1024]
+        normalization: "spectral_norm"
+        output_activation: "linear"
+    training:
+      image_size: [128, 128]
+      channels: 1
+      epochs: 300
+      batch_size: 32
+    expected_performance:
+      fid_score: "~30-50"
+      
+  # Person-Specific Models Placeholder
+  VanillaGAN-Sig-v2.0:
+    description: "Person-specific signature generation models"
+    status: "planned"
+    release_date: "TBD"
+    features:
+      - "Conditional generation based on person ID"
+      - "Style encoding for individual characteristics"
+      - "Few-shot adaptation for new users"
+      - "Signature style interpolation"
+    architecture:
+      type: "Conditional GAN"
+      generator:
+        latent_dim: 128
+        condition_dim: 64
+        embedding_type: "learned"
+      discriminator:
+        auxiliary_classifier: true
+        num_classes: "dynamic"
+    training:
+      image_size: [128, 128]
+      min_samples_per_person: 5
+      adaptation_epochs: 50
+    use_cases:
+      - "Personalized signature augmentation"
+      - "Signature style transfer"
+      - "New user enrollment"
+
+# Model Selection Guide
+model_selection:
+  generic_signatures: "VanillaGAN-Sig-v1.0"
+  improved_quality: "VanillaGAN-Sig-v1.1"
+  person_specific: "VanillaGAN-Sig-v2.0"
+
+# Changelog
+changelog:
+  - version: "v1.0"
+    date: "2024-01-01"
+    changes:
+      - "Initial release"
+      - "Basic Vanilla GAN architecture"
+      - "Support for CEDAR/GPDS datasets"
