@@ -23,7 +23,7 @@ import time
 import json
 import html
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 import torch
@@ -67,6 +67,16 @@ DEFAULT_RUNS_DIR = Path(__file__).parent.parent / "runs"
 TRAINING_STATE_FILE = Path(__file__).parent.parent / ".training_state.json"
 
 
+# -----------------------------------------------------------------------------
+# Manual test checklist
+# -----------------------------------------------------------------------------
+# 1) Load from checkpoints/ and runs/ (dropdown)
+# 2) Enter a custom path outside project folders -> rejected by default
+# 3) Enable unsafe mode -> custom path allowed (warning shown)
+# 4) Generate a large batch, click Cancel mid-run -> stops within one batch
+# 5) Refresh while training, on Linux/macOS PID check works and state clears if PID not running
+
+
 def _save_training_state(run_dir: str, pid: int, stop_file: str) -> None:
     """Save training state to file for persistence across reloads."""
     try:
@@ -82,16 +92,91 @@ def _save_training_state(run_dir: str, pid: int, stop_file: str) -> None:
 
 
 def _is_pid_running(pid: int) -> bool:
-    """Check if a process with given PID is running."""
+    """Check if a process with given PID is running (cross-platform)."""
+    if not pid or pid <= 0:
+        return False
+    # Prefer platform-native checks without extra deps.
     try:
-        import subprocess
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-            capture_output=True, text=True, timeout=5
-        )
-        return str(pid) in result.stdout
+        if os.name == "nt":
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return str(pid) in result.stdout
+        # Unix/macOS: signal 0 does not kill, only checks existence/permission.
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        # Process exists but we may not have permission to signal it.
+        return True
     except Exception:
         return False
+
+
+def _allowed_checkpoint_roots() -> List[Path]:
+    return [DEFAULT_CHECKPOINT_DIR.resolve(), DEFAULT_RUNS_DIR.resolve()]
+
+
+def _is_under_root(path: Path, root: Path) -> bool:
+    try:
+        path_resolved = path.resolve()
+        root_resolved = root.resolve()
+        path_resolved.relative_to(root_resolved)
+        return True
+    except Exception:
+        return False
+
+
+def _is_checkpoint_path_allowed(path: Path) -> bool:
+    """Return True if path is within allowed checkpoint roots."""
+    for root in _allowed_checkpoint_roots():
+        if _is_under_root(path, root):
+            return True
+    return False
+
+
+def _validate_checkpoint_path(user_path: str) -> Tuple[Optional[Path], Optional[str]]:
+    """Validate a user-provided checkpoint path exists and is a plausible checkpoint file."""
+    try:
+        p = Path(user_path).expanduser()
+        if not p.exists() or not p.is_file():
+            return None, "File not found"
+        if p.suffix.lower() not in {".pt", ".pth"}:
+            return None, "Not a .pt/.pth checkpoint file"
+        return p.resolve(), None
+    except Exception:
+        return None, "Invalid path"
+
+
+def _torch_load_checkpoint(
+    checkpoint_path: Path,
+    *,
+    map_location: str | torch.device = "cpu",
+    trusted_for_loading: bool,
+    weights_only: Optional[bool] = None,
+) -> Any:
+    """Load a checkpoint with guardrails.
+
+    IMPORTANT: PyTorch checkpoints are pickle-based. This function must only be used
+    for trusted paths (project checkpoints/runs, or explicitly enabled unsafe mode).
+    """
+    if not trusted_for_loading:
+        raise ValueError(
+            "Refusing to load an untrusted checkpoint. Enable Unsafe mode to proceed."
+        )
+
+    # Prefer weights_only=True where supported to reduce unpickling surface.
+    if weights_only is None:
+        return torch.load(str(checkpoint_path), map_location=map_location)
+    try:
+        return torch.load(
+            str(checkpoint_path), map_location=map_location, weights_only=weights_only
+        )
+    except TypeError:
+        # Older PyTorch: no weights_only arg.
+        return torch.load(str(checkpoint_path), map_location=map_location)
 
 
 def _load_training_state() -> Optional[dict]:
@@ -383,36 +468,31 @@ def _parse_metrics_from_log(log_text: str) -> Optional[pd.DataFrame]:
 # Model Loading Functions
 # -----------------------------------------------------------------------------
 
-def _checkpoint_has_discriminator(path: str) -> bool:
-    """
-    Quickly check if a checkpoint file contains discriminator weights.
-    Uses pickle scanning to avoid loading the full checkpoint into memory.
-    
-    Args:
-        path: Path to the checkpoint file
-        
-    Returns:
-        True if checkpoint contains 'discriminator_state_dict' key
+def _checkpoint_has_discriminator(path: str, trusted_for_loading: bool) -> bool:
+    """Check whether a checkpoint dict contains discriminator weights.
+
+    Note: PyTorch checkpoint loading is pickle-based. This function intentionally
+    uses a guarded load and should only be called for trusted checkpoint paths.
     """
     try:
-        # Use torch.load with map_location to avoid loading tensors
-        # We only need to check the keys, not load the actual weights
-        import pickle
-        with open(path, 'rb') as f:
-            # Read just enough to get the keys - PyTorch saves as pickle
-            # For efficiency, we do a quick check using torch.load with weights_only
-            checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-            if isinstance(checkpoint, dict):
-                return 'discriminator_state_dict' in checkpoint
+        p = Path(path)
+        checkpoint = _torch_load_checkpoint(
+            p,
+            map_location="cpu",
+            trusted_for_loading=trusted_for_loading,
+            weights_only=True,
+        )
+        return isinstance(checkpoint, dict) and (
+            "discriminator_state_dict" in checkpoint
+        )
     except Exception:
-        pass
-    return False
+        return False
 
 
 @st.cache_data
-def _cached_checkpoint_has_discriminator(path: str) -> bool:
+def _cached_checkpoint_has_discriminator(path: str, trusted_for_loading: bool) -> bool:
     """Cached version of discriminator check to avoid repeated file reads."""
-    return _checkpoint_has_discriminator(path)
+    return _checkpoint_has_discriminator(path, trusted_for_loading)
 
 
 def find_checkpoints(checkpoint_dir: Path) -> List[Path]:
@@ -463,7 +543,7 @@ def load_generator(checkpoint_path: str) -> Tuple[Generator, int, torch.device]:
 
 
 @st.cache_data
-def get_model_metadata(checkpoint_path: str) -> dict:
+def get_model_metadata(checkpoint_path: str, trusted_for_loading: bool) -> dict:
     """
     Extract metadata from checkpoint file.
     
@@ -474,20 +554,35 @@ def get_model_metadata(checkpoint_path: str) -> dict:
         Dictionary containing epoch, loss, and config
     """
     try:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        p = Path(checkpoint_path)
+        checkpoint = _torch_load_checkpoint(
+            p,
+            map_location="cpu",
+            trusted_for_loading=trusted_for_loading,
+            weights_only=True,
+        )
         if isinstance(checkpoint, dict):
+            config = checkpoint.get("config", {})
+            # Keep metadata small/safe for display.
+            if not isinstance(config, dict):
+                config = {}
             return {
-                'epoch': checkpoint.get('epoch', 'Unknown'),
-                'loss': checkpoint.get('best_g_loss', 'N/A'),
-                'config': checkpoint.get('config', {})
+                "epoch": checkpoint.get("epoch", "Unknown"),
+                "loss": checkpoint.get("best_g_loss", "N/A"),
+                "config": config,
             }
     except Exception:
-        pass
+        return {}
     return {}
 
 
 @st.cache_resource
-def load_discriminator(checkpoint_path: str, device: torch.device, image_size: int = 64) -> Optional[Discriminator]:
+def load_discriminator(
+    checkpoint_path: str,
+    device: torch.device,
+    image_size: int = 64,
+    trusted_for_loading: bool = True,
+) -> Optional[Discriminator]:
     """
     Load a trained discriminator from checkpoint with caching.
     
@@ -500,19 +595,108 @@ def load_discriminator(checkpoint_path: str, device: torch.device, image_size: i
         Discriminator model or None if not found in checkpoint
     """
     try:
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        
-        if 'discriminator_state_dict' not in checkpoint:
+        p = Path(checkpoint_path)
+        checkpoint = _torch_load_checkpoint(
+            p,
+            map_location=device,
+            trusted_for_loading=trusted_for_loading,
+            weights_only=True,
+        )
+        if not isinstance(checkpoint, dict) or "discriminator_state_dict" not in checkpoint:
             return None
-            
+
         discriminator = Discriminator(input_size=image_size)
-        discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+        discriminator.load_state_dict(checkpoint["discriminator_state_dict"])
         discriminator.to(device)
         discriminator.eval()
         return discriminator
-    except Exception as e:
-        print(f"Failed to load discriminator: {e}")
+    except Exception:
         return None
+
+
+def create_zip_archive_from_paths(
+    image_paths: List[str],
+    prefix: str = "signature",
+    format: str = "PNG",
+    quality: int = 95,
+    selected_indices: Optional[List[int]] = None,
+    filename_template: str = "{prefix}_{index:03d}",
+) -> bytes:
+    """Create a ZIP archive from image file paths (loads one-by-one)."""
+    zip_buffer = io.BytesIO()
+    if selected_indices is not None:
+        items = [(idx, image_paths[idx]) for idx in selected_indices if 0 <= idx < len(image_paths)]
+    else:
+        items = list(enumerate(image_paths))
+
+    ext = "jpg" if format.upper() == "JPEG" else "png"
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for new_idx, (orig_idx, path) in enumerate(items, start=1):
+            img_buffer = io.BytesIO()
+            with Image.open(path) as opened:
+                img = opened.copy()
+
+            if format.upper() == "JPEG":
+                if img.mode == "RGBA":
+                    rgb_img = Image.new("RGB", img.size, (255, 255, 255))
+                    rgb_img.paste(img, mask=img.split()[3])
+                    img = rgb_img
+                elif img.mode != "RGB":
+                    img = img.convert("RGB")
+                img.save(img_buffer, format="JPEG", quality=quality)
+            else:
+                img.save(img_buffer, format="PNG")
+
+            img_buffer.seek(0)
+            filename = (
+                filename_template.format(prefix=prefix, index=new_idx, total=len(items))
+                + f".{ext}"
+            )
+            zip_file.writestr(filename, img_buffer.getvalue())
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+
+def save_images_to_folder_from_paths(
+    image_paths: List[str],
+    output_dir: str,
+    prefix: str = "signature",
+    format: str = "PNG",
+    quality: int = 95,
+    selected_indices: Optional[List[int]] = None,
+    filename_template: str = "{prefix}_{index:03d}",
+) -> Tuple[int, str]:
+    """Save/copy images from paths to a folder (loads one-by-one)."""
+    os.makedirs(output_dir, exist_ok=True)
+    if selected_indices is not None:
+        items = [(idx, image_paths[idx]) for idx in selected_indices if 0 <= idx < len(image_paths)]
+    else:
+        items = list(enumerate(image_paths))
+
+    ext = "jpg" if format.upper() == "JPEG" else "png"
+    saved_count = 0
+    for new_idx, (_, src_path) in enumerate(items, start=1):
+        with Image.open(src_path) as opened:
+            img = opened.copy()
+        filename = (
+            filename_template.format(prefix=prefix, index=new_idx, total=len(items))
+            + f".{ext}"
+        )
+        dst_path = os.path.join(output_dir, filename)
+        if format.upper() == "JPEG":
+            if img.mode == "RGBA":
+                rgb_img = Image.new("RGB", img.size, (255, 255, 255))
+                rgb_img.paste(img, mask=img.split()[3])
+                img = rgb_img
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(dst_path, format="JPEG", quality=quality)
+        else:
+            img.save(dst_path, format="PNG")
+        saved_count += 1
+
+    return saved_count, output_dir
 
 
 # -----------------------------------------------------------------------------
@@ -737,6 +921,24 @@ def render_generation_page():
     
     # Sidebar Controls for Generation
     st.sidebar.header("⚙️ Generation Settings")
+
+    with st.sidebar.expander("🔐 Security Notes", expanded=False):
+        st.markdown(
+            """PyTorch checkpoints are **pickle-based** and can execute code when loaded.
+
+For safety, this app only loads checkpoints from project folders by default:
+- `checkpoints/`
+- `runs/`
+
+Only enable **Unsafe mode** for files you explicitly trust.
+"""
+        )
+        unsafe_mode = st.checkbox(
+            "Unsafe mode (allow checkpoints outside project folders)",
+            value=False,
+            key="unsafe_checkpoint_mode",
+            help="Allows loading arbitrary local checkpoint paths. Only enable for trusted files.",
+        )
     checkpoints = find_checkpoints(DEFAULT_CHECKPOINT_DIR)
     
     selected_checkpoint_path = None
@@ -797,16 +999,40 @@ def render_generation_page():
         1. Go to **Train** page to train a model
         2. Or place `.pt` files in `checkpoints/` folder
         """)
-        custom_path = st.sidebar.text_input("📁 Or enter custom path:", placeholder="C:/path/to/checkpoint.pt")
-        selected_checkpoint_path = custom_path if custom_path and Path(custom_path).exists() else None
-        if custom_path and not Path(custom_path).exists():
-            st.sidebar.error("File not found")
+        custom_path = st.sidebar.text_input(
+            "📁 Or enter custom path:",
+            placeholder="C:/path/to/checkpoint.pt",
+            help="By default, only project checkpoints/runs are allowed. Enable Unsafe mode to load others.",
+        )
+        selected_checkpoint_path = None
         if custom_path:
-            selected_model_name = Path(custom_path).stem
+            cp, err = _validate_checkpoint_path(custom_path)
+            if err:
+                st.sidebar.error(err)
+            else:
+                if _is_checkpoint_path_allowed(cp) or unsafe_mode:
+                    selected_checkpoint_path = str(cp)
+                    selected_model_name = cp.stem
+                else:
+                    st.sidebar.error(
+                        "For safety, custom checkpoints must be under the project `checkpoints/` or `runs/` folders. "
+                        "Enable Unsafe mode to load a checkpoint from elsewhere."
+                    )
             
-    # Metadata
+    # Determine trust for any downstream torch.load usage
+    trusted_for_loading = False
+    if selected_checkpoint_path:
+        try:
+            trusted_for_loading = _is_checkpoint_path_allowed(Path(selected_checkpoint_path)) or unsafe_mode
+        except Exception:
+            trusted_for_loading = False
+
+    # Metadata (guarded)
     if selected_checkpoint_path and os.path.exists(selected_checkpoint_path):
-        metadata = get_model_metadata(selected_checkpoint_path)
+        if trusted_for_loading:
+            metadata = get_model_metadata(selected_checkpoint_path, trusted_for_loading=trusted_for_loading)
+        else:
+            metadata = {}
         if metadata:
             with st.sidebar.expander("ℹ️ Model Card", expanded=True):
                 st.markdown(f"**Epoch:** {metadata.get('epoch', 'N/A')}")
@@ -838,8 +1064,10 @@ def render_generation_page():
     
     # Check discriminator availability BEFORE loading (using cached check)
     has_discriminator = False
-    if selected_checkpoint_path and os.path.exists(selected_checkpoint_path):
-        has_discriminator = _cached_checkpoint_has_discriminator(selected_checkpoint_path)
+    if selected_checkpoint_path and os.path.exists(selected_checkpoint_path) and trusted_for_loading:
+        has_discriminator = _cached_checkpoint_has_discriminator(
+            selected_checkpoint_path, trusted_for_loading=trusted_for_loading
+        )
     
     # Show checkbox with warning indicator if discriminator unavailable
     quality_col1, quality_col2 = st.sidebar.columns([3, 1])
@@ -855,6 +1083,13 @@ def render_generation_page():
         use_quality_filter = False
     
     quality_ratio = st.sidebar.slider("Oversampling Ratio", 1.5, 5.0, 2.0, 0.5, help="Generate N× more, keep best ones") if use_quality_filter else 1.0
+
+    # Lightweight guardrail warning
+    total_samples_est = int(n_signatures * quality_ratio) if use_quality_filter else int(n_signatures)
+    if (not torch.cuda.is_available()) and total_samples_est >= 500:
+        st.sidebar.warning(
+            "Large CPU generation requested. Consider reducing count or disabling quality oversampling."
+        )
         
     # Post-processing
     st.sidebar.subheader("🎨 Post-Processing")
@@ -886,8 +1121,39 @@ def render_generation_page():
         st.caption("On" if use_quality_filter else "Off")
 
     # Main Logic
-    if 'generated_images' not in st.session_state:
-        st.session_state.generated_images = []
+    if "generated_image_paths" not in st.session_state:
+        st.session_state.generated_image_paths = []
+
+    # Generation progress state (cooperative across reruns)
+    if "gen_state" not in st.session_state:
+        st.session_state.gen_state = "idle"  # idle|running|complete|cancelled
+    if "gen_cancel_requested" not in st.session_state:
+        st.session_state.gen_cancel_requested = False
+    if "gen_output_dir" not in st.session_state:
+        st.session_state.gen_output_dir = None
+    if "gen_total_samples" not in st.session_state:
+        st.session_state.gen_total_samples = 0
+    if "gen_target_n" not in st.session_state:
+        st.session_state.gen_target_n = 0
+    if "gen_next_index" not in st.session_state:
+        st.session_state.gen_next_index = 0
+    if "gen_batch_size" not in st.session_state:
+        st.session_state.gen_batch_size = 32
+    if "gen_records" not in st.session_state:
+        # For quality filtering: list of {path: str, score: float}
+        st.session_state.gen_records = []
+    if "gen_use_quality_filter" not in st.session_state:
+        st.session_state.gen_use_quality_filter = False
+    if "gen_apply_threshold" not in st.session_state:
+        st.session_state.gen_apply_threshold = False
+    if "gen_threshold_value" not in st.session_state:
+        st.session_state.gen_threshold_value = 127
+    if "gen_make_transparent" not in st.session_state:
+        st.session_state.gen_make_transparent = False
+    if "gen_noise_scale" not in st.session_state:
+        st.session_state.gen_noise_scale = 1.0
+    if "gen_seed" not in st.session_state:
+        st.session_state.gen_seed = None
     
     model_loaded = False
     generator = None
@@ -896,14 +1162,23 @@ def render_generation_page():
     device = torch.device('cpu')
     
     if selected_checkpoint_path and os.path.exists(selected_checkpoint_path):
-        try:
-            with st.spinner("Loading models..."):
-                generator, latent_dim, device = load_generator(selected_checkpoint_path)
-                if use_quality_filter:
-                    discriminator = load_discriminator(selected_checkpoint_path, device)
-            model_loaded = True
-        except Exception as e:
-            st.error(f"❌ Failed to load model: {str(e)}")
+        if not trusted_for_loading:
+            st.error(
+                "❌ Refusing to load checkpoint outside project folders. Enable Unsafe mode in the sidebar to proceed."
+            )
+        else:
+            try:
+                with st.spinner("Loading models..."):
+                    generator, latent_dim, device = load_generator(selected_checkpoint_path)
+                    if use_quality_filter:
+                        discriminator = load_discriminator(
+                            selected_checkpoint_path,
+                            device,
+                            trusted_for_loading=trusted_for_loading,
+                        )
+                model_loaded = True
+            except Exception as e:
+                st.error(f"❌ Failed to load model: {str(e)}")
 
     # Readiness banner
     if model_loaded:
@@ -981,132 +1256,150 @@ def render_generation_page():
                 else:
                     st.caption("Enable 'Clean Up' in sidebar to see post-processing")
         
-        # Initialize cancellation state
-        if 'generation_cancelled' not in st.session_state:
-            st.session_state.generation_cancelled = False
-        
+        # Start generation (initialize state and rerun)
         if generate_button and model_loaded and generator is not None:
-            st.session_state.generated_images = []
-            st.session_state.generation_cancelled = False
-            
-            progress_bar = st.progress(0, text="Starting generation...")
-            status_container = st.container()
-            
-            with status_container:
-                status_col1, status_col2 = st.columns([3, 1])
-                with status_col1:
-                    status_text = st.empty()
-                with status_col2:
-                    cancel_placeholder = st.empty()
-            
-            # Show cancel button during generation
-            cancel_clicked = cancel_placeholder.button("🛑 Cancel", key="cancel_generation", type="secondary", use_container_width=True)
-            
-            if cancel_clicked:
-                st.session_state.generation_cancelled = True
-            
-            # Track images generated for real-time feedback
-            images_generated_count = [0]  # Use list for mutable reference in callback
-            
-            def update_progress(progress: float) -> None:
-                if st.session_state.generation_cancelled:
-                    return  # Skip update if cancelled
-                current_count = int(progress * total_samples)
-                images_generated_count[0] = current_count
-                progress_bar.progress(progress, text=f"Generating signatures... {current_count}/{total_samples}")
-                status_text.text(f"🔄 Generated {current_count} of {total_samples} signatures ({int(progress * 100)}%)")
-            
+            run_dir = DEFAULT_SAMPLE_DIR / _new_run_id("gen")
+            run_dir.mkdir(parents=True, exist_ok=True)
+
+            st.session_state.generated_image_paths = []
+            st.session_state.selected_images = set()
+
+            st.session_state.gen_state = "running"
+            st.session_state.gen_cancel_requested = False
+            st.session_state.gen_output_dir = str(run_dir)
+            st.session_state.gen_records = []
+            st.session_state.gen_next_index = 0
+            st.session_state.gen_batch_size = 32
+            st.session_state.gen_use_quality_filter = bool(use_quality_filter)
+            st.session_state.gen_apply_threshold = bool(apply_threshold)
+            st.session_state.gen_threshold_value = int(threshold_value)
+            st.session_state.gen_make_transparent = bool(make_transparent)
+            st.session_state.gen_noise_scale = float(noise_scale)
+            st.session_state.gen_seed = int(seed) if seed is not None else None
+            st.session_state.gen_target_n = int(n_signatures)
+            st.session_state.gen_total_samples = int(n_signatures * quality_ratio) if use_quality_filter else int(n_signatures)
+
+            st.rerun()
+
+        # Cooperative generation step (one batch per rerun)
+        if st.session_state.gen_state == "running":
+            total_samples = int(st.session_state.gen_total_samples)
+            next_index = int(st.session_state.gen_next_index)
+            batch_size = int(st.session_state.gen_batch_size)
+
+            progress = 0.0 if total_samples <= 0 else min(1.0, next_index / total_samples)
+            progress_bar = st.progress(progress, text=f"Generating signatures... {next_index}/{total_samples}")
+
+            status_col1, status_col2 = st.columns([3, 1])
+            with status_col1:
+                status_text = st.empty()
+            with status_col2:
+                if st.button("🛑 Cancel", key="cancel_generation_running", type="secondary", use_container_width=True):
+                    st.session_state.gen_cancel_requested = True
+                    st.rerun()
+
+            if st.session_state.gen_cancel_requested:
+                status_text.warning(
+                    f"⚠️ Cancellation requested. Finalizing {next_index} generated samples..."
+                )
+
+            def _finalize_generation(state: str) -> None:
+                use_q = bool(st.session_state.gen_use_quality_filter)
+                if use_q:
+                    records = list(st.session_state.gen_records)
+                    records.sort(key=lambda r: r.get("score", float("-inf")), reverse=True)
+                    target_n = int(st.session_state.gen_target_n)
+                    selected = records[: min(target_n, len(records))]
+                    selected_paths = [r["path"] for r in selected if "path" in r]
+                    st.session_state.generated_image_paths = selected_paths
+
+                    # Delete non-selected oversamples to save disk.
+                    selected_set = set(selected_paths)
+                    for r in records:
+                        p = r.get("path")
+                        if p and p not in selected_set:
+                            try:
+                                Path(p).unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                # Non-quality filter already appended paths to generated_image_paths
+                st.session_state.gen_state = state
+
             try:
-                total_samples = int(n_signatures * quality_ratio) if use_quality_filter else n_signatures
-                
-                # Custom batch generation with cancellation support
-                images = []
-                batch_size = 32
-                num_batches = (total_samples + batch_size - 1) // batch_size
-                
-                for batch_idx in range(num_batches):
-                    # Check for cancellation
-                    if st.session_state.generation_cancelled:
-                        cancel_placeholder.empty()
-                        progress_bar.empty()
-                        status_text.warning(f"⚠️ Generation cancelled. Generated {len(images)} of {total_samples} signatures.")
-                        if images:  # Keep what we generated
-                            st.session_state.generated_images = images
-                        break
-                    
-                    current_batch_size = min(batch_size, total_samples - len(images))
-                    batch_images = generate_signatures_batch(
-                        generator=generator, n_samples=current_batch_size, latent_dim=latent_dim,
-                        device=device, seed=seed + batch_idx if seed else None, batch_size=current_batch_size, noise_scale=noise_scale
-                    )
-                    images.extend(batch_images)
-                    
-                    # Update progress
-                    progress = len(images) / total_samples
-                    update_progress(progress)
-                
-                # Hide cancel button after generation
-                cancel_placeholder.empty()
-                
-                # Skip rest if cancelled
-                if st.session_state.generation_cancelled and not images:
-                    pass  # Nothing to process
-                elif st.session_state.generation_cancelled:
-                    pass  # Already handled above
-                
+                # Stop within one batch when cancelled.
+                if st.session_state.gen_cancel_requested:
+                    _finalize_generation("cancelled")
+                elif next_index >= total_samples:
+                    _finalize_generation("complete")
                 else:
-                    # Normal completion - process images
-                    if use_quality_filter and discriminator is not None:
-                        status_text.text("Scoring signatures...")
-                        scores = []
-                        score_batch_size = 32
-                        for i in range(0, len(images), score_batch_size):
-                            batch_imgs = images[i:i+score_batch_size]
-                            batch_tensors = []
-                            for img in batch_imgs:
-                                img_gray = img.convert('L')
-                                t = torch.from_numpy(np.array(img_gray)).float().unsqueeze(0) / 127.5 - 1.0
-                                batch_tensors.append(t)
-                            batch_input = torch.stack(batch_tensors).to(device)
-                            with torch.no_grad():
-                                batch_scores = discriminator(batch_input).cpu().numpy().flatten()
-                                scores.extend(batch_scores)
-                        
-                        scored_images = list(zip(images, scores))
-                        scored_images.sort(key=lambda x: x[1], reverse=True)
-                        images = [img for img, score in scored_images[:n_signatures]]
-                        avg_score = np.mean([score for img, score in scored_images[:n_signatures]])
-                        st.info(f"💎 Quality Filter: Kept top {n_signatures} of {total_samples}. Avg Realism Score: {avg_score:.4f}")
+                    current_batch_size = min(batch_size, total_samples - next_index)
+                    batch_number = next_index // batch_size
+                    base_seed = st.session_state.gen_seed
+                    batch_seed = (base_seed + batch_number) if base_seed is not None else None
+                    status_text.text(
+                        f"🔄 Generating batch {batch_number + 1} ({current_batch_size} samples)..."
+                    )
 
-                    if apply_threshold:
-                        status_text.text("Applying post-processing...")
-                        images = process_images(images, threshold=threshold_value, make_transparent=make_transparent)
+                    batch_images = generate_signatures_batch(
+                        generator=generator,
+                        n_samples=current_batch_size,
+                        latent_dim=latent_dim,
+                        device=device,
+                        seed=batch_seed,
+                        batch_size=current_batch_size,
+                        noise_scale=float(st.session_state.gen_noise_scale),
+                    )
 
-                    st.session_state.generated_images = images
-                    status_text.text("Compressing files...")
-                    zip_filename = f"Signatures_{selected_model_name}.zip"
-                    image_prefix = f"Signature_{selected_model_name}"
-                    zip_data = create_zip_archive(images, prefix=image_prefix)
-                    sheet_data = create_contact_sheet(images, cols=4)
-                    
-                    st.session_state.zip_data = zip_data
-                    st.session_state.zip_name = zip_filename
-                    st.session_state.sheet_data = sheet_data
-                    
-                    progress_bar.progress(1.0, text="Generation complete!")
-                    status_text.text("Processing complete!")
-                    st.success(f"✅ Generated {len(images)} signatures successfully!")
-                
+                    if st.session_state.gen_apply_threshold:
+                        batch_images = process_images(
+                            batch_images,
+                            threshold=int(st.session_state.gen_threshold_value),
+                            make_transparent=bool(st.session_state.gen_make_transparent),
+                        )
+
+                    out_dir = Path(st.session_state.gen_output_dir)
+
+                    # Optional scoring (stores only score + file path)
+                    scores: Optional[List[float]] = None
+                    if st.session_state.gen_use_quality_filter and discriminator is not None:
+                        batch_tensors = []
+                        for img in batch_images:
+                            img_gray = img.convert("L")
+                            t = torch.from_numpy(np.array(img_gray)).float().unsqueeze(0) / 127.5 - 1.0
+                            batch_tensors.append(t)
+                        batch_input = torch.stack(batch_tensors).to(device)
+                        with torch.no_grad():
+                            scores = discriminator(batch_input).cpu().numpy().flatten().tolist()
+
+                    for i, img in enumerate(batch_images):
+                        idx = next_index + i
+                        file_path = out_dir / f"sample_{idx + 1:05d}.png"
+                        img.save(str(file_path), format="PNG")
+                        if scores is not None:
+                            st.session_state.gen_records.append(
+                                {"path": str(file_path), "score": float(scores[i])}
+                            )
+                        else:
+                            st.session_state.generated_image_paths.append(str(file_path))
+
+                    st.session_state.gen_next_index = next_index + current_batch_size
+                    st.rerun()
             except Exception as e:
                 st.error(f"❌ Generation failed: {str(e)}")
-                progress_bar.empty()
-                status_text.empty()
+                st.session_state.gen_state = "idle"
+
+        if st.session_state.gen_state == "complete" and st.session_state.generated_image_paths:
+            st.success(f"✅ Generated {len(st.session_state.generated_image_paths)} signatures successfully!")
+        elif st.session_state.gen_state == "cancelled" and st.session_state.generated_image_paths:
+            st.warning(f"⚠️ Generation cancelled. Kept {len(st.session_state.generated_image_paths)} signatures.")
+        elif st.session_state.gen_state == "cancelled":
+            st.warning("⚠️ Generation cancelled.")
         
-        if st.session_state.generated_images:
+        if st.session_state.generated_image_paths:
             st.divider()
             
-            images = st.session_state.generated_images
-            num_images = len(images)
+            image_paths = st.session_state.generated_image_paths
+            num_images = len(image_paths)
             
             # Initialize selection state
             if 'selected_images' not in st.session_state:
@@ -1175,8 +1468,8 @@ def render_generation_page():
                     selected_list = sorted(st.session_state.selected_images) if selection_mode and st.session_state.selected_images else None
                     download_count = len(selected_list) if selected_list else num_images
                     
-                    zip_data = create_zip_archive(
-                        images,
+                    zip_data = create_zip_archive_from_paths(
+                        image_paths,
                         prefix=filename_prefix,
                         format=export_format,
                         quality=jpeg_quality,
@@ -1213,8 +1506,8 @@ def render_generation_page():
                     st.markdown("<br>", unsafe_allow_html=True)  # Spacing
                     if st.button("💾 Save to Disk", use_container_width=True, type="secondary"):
                         try:
-                            saved_count, saved_path = save_images_to_folder(
-                                images,
+                            saved_count, saved_path = save_images_to_folder_from_paths(
+                                image_paths,
                                 save_folder,
                                 prefix=filename_prefix,
                                 format=export_format,
@@ -1229,7 +1522,16 @@ def render_generation_page():
                 # Contact sheet (no nested expander to avoid Streamlit nesting error)
                 st.markdown("**📄 Contact Sheet**")
                 sheet_cols = st.slider("Columns", 2, 10, 4, key="sheet_cols")
-                sheet_images = [images[i] for i in sorted(st.session_state.selected_images)] if selection_mode and st.session_state.selected_images else images
+                sheet_src_paths = [
+                    image_paths[i] for i in sorted(st.session_state.selected_images)
+                ] if selection_mode and st.session_state.selected_images else image_paths
+                sheet_images = []
+                for p in sheet_src_paths:
+                    try:
+                        with Image.open(p) as opened:
+                            sheet_images.append(opened.copy())
+                    except Exception:
+                        pass
                 sheet_data = create_contact_sheet(sheet_images, cols=sheet_cols)
                 if sheet_data:
                     st.download_button("📄 Download Contact Sheet", sheet_data, f"Contact_Sheet_{filename_prefix}.png", "image/png", use_container_width=True)
@@ -1281,12 +1583,12 @@ def render_generation_page():
             # Get images for current page
             start_idx = (current_page - 1) * IMAGES_PER_PAGE
             end_idx = min(start_idx + IMAGES_PER_PAGE, num_images)
-            display_images = images[start_idx:end_idx]
+            display_paths = image_paths[start_idx:end_idx]
             
             # Display grid with selection or download
-            num_cols = 6 if len(display_images) > 12 else (4 if len(display_images) > 4 else max(len(display_images), 1))
+            num_cols = 6 if len(display_paths) > 12 else (4 if len(display_paths) > 4 else max(len(display_paths), 1))
             cols = st.columns(num_cols)
-            for idx, img in enumerate(display_images):
+            for idx, img_path in enumerate(display_paths):
                 actual_idx = start_idx + idx
                 with cols[idx % num_cols]:
                     # Show selection indicator
@@ -1294,7 +1596,7 @@ def render_generation_page():
                     if selection_mode and is_selected:
                         st.markdown("<div class=\"sg-selected-pill\">Selected ✓</div>", unsafe_allow_html=True)
                     
-                    st.image(img, caption=f"#{actual_idx + 1}" + (" ✓" if is_selected else ""), use_container_width=True)
+                    st.image(img_path, caption=f"#{actual_idx + 1}" + (" ✓" if is_selected else ""), use_container_width=True)
                     
                     if selection_mode:
                         # Toggle selection checkbox
@@ -1309,6 +1611,8 @@ def render_generation_page():
                             st.session_state.selected_images.discard(actual_idx)
                     else:
                         # Individual download button
+                        with Image.open(img_path) as opened:
+                            img = opened.copy()
                         img_buf = io.BytesIO()
                         if export_format == "JPEG":
                             rgb_img = img.convert("RGB") if img.mode != "RGB" else img

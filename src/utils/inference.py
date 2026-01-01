@@ -66,7 +66,11 @@ def load_generator(checkpoint_path: str, device: torch.device) -> Tuple[Generato
         Tuple of (Generator model, latent_dim)
     """
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # NOTE: Checkpoints are pickle-based. Prefer weights_only=True when available.
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
     
     # Extract configuration and state dict
     if isinstance(checkpoint, dict):
