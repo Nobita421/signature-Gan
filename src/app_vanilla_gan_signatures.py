@@ -383,6 +383,38 @@ def _parse_metrics_from_log(log_text: str) -> Optional[pd.DataFrame]:
 # Model Loading Functions
 # -----------------------------------------------------------------------------
 
+def _checkpoint_has_discriminator(path: str) -> bool:
+    """
+    Quickly check if a checkpoint file contains discriminator weights.
+    Uses pickle scanning to avoid loading the full checkpoint into memory.
+    
+    Args:
+        path: Path to the checkpoint file
+        
+    Returns:
+        True if checkpoint contains 'discriminator_state_dict' key
+    """
+    try:
+        # Use torch.load with map_location to avoid loading tensors
+        # We only need to check the keys, not load the actual weights
+        import pickle
+        with open(path, 'rb') as f:
+            # Read just enough to get the keys - PyTorch saves as pickle
+            # For efficiency, we do a quick check using torch.load with weights_only
+            checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+            if isinstance(checkpoint, dict):
+                return 'discriminator_state_dict' in checkpoint
+    except Exception:
+        pass
+    return False
+
+
+@st.cache_data
+def _cached_checkpoint_has_discriminator(path: str) -> bool:
+    """Cached version of discriminator check to avoid repeated file reads."""
+    return _checkpoint_has_discriminator(path)
+
+
 def find_checkpoints(checkpoint_dir: Path) -> List[Path]:
     """
     Find all available checkpoint files in the checkpoint directory.
@@ -487,30 +519,125 @@ def load_discriminator(checkpoint_path: str, device: torch.device, image_size: i
 # Generation Functions
 # -----------------------------------------------------------------------------
 
-def create_zip_archive(images: List[Image.Image], prefix: str = "signature") -> bytes:
+def create_zip_archive(
+    images: List[Image.Image], 
+    prefix: str = "signature",
+    format: str = "PNG",
+    quality: int = 95,
+    selected_indices: Optional[List[int]] = None,
+    filename_template: str = "{prefix}_{index:03d}"
+) -> bytes:
     """
-    Create a ZIP archive containing all generated images.
+    Create a ZIP archive containing generated images.
     
     Args:
         images: List of PIL Image objects
         prefix: Filename prefix for images
+        format: Image format ('PNG' or 'JPEG')
+        quality: JPEG quality (1-100), ignored for PNG
+        selected_indices: Optional list of indices to include (None = all)
+        filename_template: Template for filenames. Supports {prefix}, {index}, {total}
         
     Returns:
         ZIP archive as bytes
     """
     zip_buffer = io.BytesIO()
     
+    # Determine which images to include
+    if selected_indices is not None:
+        items = [(idx, images[idx]) for idx in selected_indices if 0 <= idx < len(images)]
+    else:
+        items = list(enumerate(images))
+    
+    ext = "jpg" if format.upper() == "JPEG" else "png"
+    
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for idx, img in enumerate(images, start=1):
+        for new_idx, (orig_idx, img) in enumerate(items, start=1):
             img_buffer = io.BytesIO()
-            img.save(img_buffer, format='PNG')
+            
+            # Convert RGBA to RGB for JPEG
+            if format.upper() == "JPEG" and img.mode == "RGBA":
+                rgb_img = Image.new("RGB", img.size, (255, 255, 255))
+                rgb_img.paste(img, mask=img.split()[3])
+                img = rgb_img
+            elif format.upper() == "JPEG" and img.mode != "RGB":
+                img = img.convert("RGB")
+            
+            if format.upper() == "JPEG":
+                img.save(img_buffer, format='JPEG', quality=quality)
+            else:
+                img.save(img_buffer, format='PNG')
             img_buffer.seek(0)
             
-            filename = f"{prefix}_{idx:03d}.png"
+            filename = filename_template.format(
+                prefix=prefix, 
+                index=new_idx, 
+                total=len(items)
+            ) + f".{ext}"
             zip_file.writestr(filename, img_buffer.getvalue())
     
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
+
+
+def save_images_to_folder(
+    images: List[Image.Image],
+    output_dir: str,
+    prefix: str = "signature",
+    format: str = "PNG",
+    quality: int = 95,
+    selected_indices: Optional[List[int]] = None,
+    filename_template: str = "{prefix}_{index:03d}"
+) -> Tuple[int, str]:
+    """
+    Save generated images directly to a folder on disk.
+    
+    Args:
+        images: List of PIL Image objects
+        output_dir: Directory to save images to
+        prefix: Filename prefix
+        format: Image format ('PNG' or 'JPEG')
+        quality: JPEG quality (1-100)
+        selected_indices: Optional list of indices to include
+        filename_template: Template for filenames
+        
+    Returns:
+        Tuple of (number of saved images, output directory path)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    if selected_indices is not None:
+        items = [(idx, images[idx]) for idx in selected_indices if 0 <= idx < len(images)]
+    else:
+        items = list(enumerate(images))
+    
+    ext = "jpg" if format.upper() == "JPEG" else "png"
+    saved_count = 0
+    
+    for new_idx, (orig_idx, img) in enumerate(items, start=1):
+        # Convert RGBA to RGB for JPEG
+        if format.upper() == "JPEG" and img.mode == "RGBA":
+            rgb_img = Image.new("RGB", img.size, (255, 255, 255))
+            rgb_img.paste(img, mask=img.split()[3])
+            img = rgb_img
+        elif format.upper() == "JPEG" and img.mode != "RGB":
+            img = img.convert("RGB")
+        
+        filename = filename_template.format(
+            prefix=prefix,
+            index=new_idx,
+            total=len(items)
+        ) + f".{ext}"
+        
+        filepath = os.path.join(output_dir, filename)
+        
+        if format.upper() == "JPEG":
+            img.save(filepath, format='JPEG', quality=quality)
+        else:
+            img.save(filepath, format='PNG')
+        saved_count += 1
+    
+    return saved_count, output_dir
 
 
 def create_contact_sheet(images: List[Image.Image], cols: int = 4) -> bytes:
@@ -598,7 +725,15 @@ def process_images(images: List[Image.Image], threshold: int = 127, make_transpa
 # -----------------------------------------------------------------------------
 
 def render_generation_page():
-    st.header("🚀 Generate Signatures")
+    st.markdown(
+        """
+        <div class="sg-hero">
+          <div class="sg-hero-title">🚀 Generate Signatures</div>
+          <div class="sg-hero-sub">Batch generation, quality filtering, post-processing, and latent morphing — all from your trained checkpoints.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     
     # Sidebar Controls for Generation
     st.sidebar.header("⚙️ Generation Settings")
@@ -642,6 +777,18 @@ def render_generation_page():
             help="📦 = checkpoints folder, 🏃 = training runs"
         )
         selected_checkpoint_path = checkpoint_options[selected_checkpoint_name]
+        
+        # Track checkpoint changes and clear morph state when changed
+        if 'last_selected_checkpoint' not in st.session_state:
+            st.session_state.last_selected_checkpoint = None
+        
+        if st.session_state.last_selected_checkpoint != selected_checkpoint_path:
+            # Checkpoint changed - clear morph state
+            st.session_state.morph_z1 = None
+            st.session_state.morph_z2 = None
+            st.session_state.morph_img1 = None
+            st.session_state.morph_img2 = None
+            st.session_state.last_selected_checkpoint = selected_checkpoint_path
         selected_model_name = selected_checkpoint_name.replace(" (", "_").replace(")", "").replace(" ", "_").replace("/", "_").replace("🏃 ", "").replace("📦 ", "").replace("📄 ", "")
     else:
         st.sidebar.error("⚠️ No checkpoints found!")
@@ -688,7 +835,25 @@ def render_generation_page():
             
     # Quality
     st.sidebar.subheader("💎 Quality Control")
-    use_quality_filter = st.sidebar.checkbox("Filter by Realism", False, help="Uses discriminator to score and keep only the best signatures")
+    
+    # Check discriminator availability BEFORE loading (using cached check)
+    has_discriminator = False
+    if selected_checkpoint_path and os.path.exists(selected_checkpoint_path):
+        has_discriminator = _cached_checkpoint_has_discriminator(selected_checkpoint_path)
+    
+    # Show checkbox with warning indicator if discriminator unavailable
+    quality_col1, quality_col2 = st.sidebar.columns([3, 1])
+    with quality_col1:
+        use_quality_filter = st.checkbox("Filter by Realism", False, help="Uses discriminator to score and keep only the best signatures")
+    with quality_col2:
+        if not has_discriminator and selected_checkpoint_path:
+            st.markdown("⚠️", help="This checkpoint doesn't include discriminator weights. Quality filtering unavailable.")
+    
+    # Show expanded warning if user tries to enable filter without discriminator
+    if use_quality_filter and not has_discriminator:
+        st.sidebar.warning("⚠️ Quality filter unavailable: Use a `checkpoint_epoch_*.pt` or `checkpoint_best.pt` file.")
+        use_quality_filter = False
+    
     quality_ratio = st.sidebar.slider("Oversampling Ratio", 1.5, 5.0, 2.0, 0.5, help="Generate N× more, keep best ones") if use_quality_filter else 1.0
         
     # Post-processing
@@ -704,6 +869,21 @@ def render_generation_page():
     st.sidebar.divider()
     device_name = "GPU (CUDA)" if torch.cuda.is_available() else "CPU"
     st.sidebar.info(f"🖥️ Running on: **{device_name}**")
+
+    # Compact overview row (main area)
+    ov1, ov2, ov3, ov4 = st.columns([2.2, 1, 1, 1])
+    with ov1:
+        st.markdown("**Selected checkpoint**")
+        st.caption(selected_model_name if selected_checkpoint_path else "—")
+    with ov2:
+        st.markdown("**Device**")
+        st.caption(device_name)
+    with ov3:
+        st.markdown("**Requested**")
+        st.caption(f"{n_signatures} signatures")
+    with ov4:
+        st.markdown("**Quality filter**")
+        st.caption("On" if use_quality_filter else "Off")
 
     # Main Logic
     if 'generated_images' not in st.session_state:
@@ -721,16 +901,36 @@ def render_generation_page():
                 generator, latent_dim, device = load_generator(selected_checkpoint_path)
                 if use_quality_filter:
                     discriminator = load_discriminator(selected_checkpoint_path, device)
-                    if discriminator is None:
-                        st.warning("⚠️ Quality filter unavailable: This checkpoint doesn't include discriminator weights. Use a `checkpoint_epoch_*.pt` or `checkpoint_best.pt` file for quality filtering.")
-                        use_quality_filter = False
             model_loaded = True
         except Exception as e:
             st.error(f"❌ Failed to load model: {str(e)}")
+
+    # Readiness banner
+    if model_loaded:
+        st.markdown(
+            f"""<div class="sg-banner ok">
+            <div class="sg-banner-title">Ready</div>
+            <div class="sg-banner-sub">Latent dim: <b>{latent_dim}</b> • Checkpoint: <b>{selected_model_name}</b></div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            """<div class="sg-banner warn">
+            <div class="sg-banner-title">Model not loaded</div>
+            <div class="sg-banner-sub">Select a valid checkpoint in the sidebar to enable generation.</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
     
     tab_batch, tab_morph = st.tabs(["🚀 Batch Generation", "🧬 Morphing"])
     
     with tab_batch:
+        st.markdown(
+            """<div class="sg-section-title">Generation Console</div>
+            <div class="sg-section-sub">Preview first, then generate your batch. Use cancel to stop early and keep partial results.</div>""",
+            unsafe_allow_html=True,
+        )
         # Preview + Generate buttons side by side
         btn_col1, btn_col2 = st.columns([1, 2])
         with btn_col1:
@@ -738,7 +938,13 @@ def render_generation_page():
         with btn_col2:
             generate_button = st.button(f"🚀 Generate {n_signatures} Signatures", type="primary", disabled=not model_loaded, use_container_width=True)
         
-        # Handle preview
+        # Initialize preview state
+        if 'preview_image' not in st.session_state:
+            st.session_state.preview_image = None
+        if 'preview_processed' not in st.session_state:
+            st.session_state.preview_processed = None
+        
+        # Handle preview generation
         if preview_button and model_loaded and generator is not None:
             with st.spinner("Generating preview..."):
                 preview_images = generate_signatures_batch(
@@ -746,73 +952,150 @@ def render_generation_page():
                     device=device, seed=seed, batch_size=1, noise_scale=noise_scale
                 )
                 if preview_images:
-                    preview_img = preview_images[0]
-                    col_orig, col_proc = st.columns(2)
-                    with col_orig:
-                        st.image(preview_img, caption="Raw Output", use_container_width=True)
-                    with col_proc:
-                        if apply_threshold:
-                            processed = process_images([preview_img], threshold=threshold_value, make_transparent=make_transparent)
-                            st.image(processed[0], caption=f"After Processing (threshold={threshold_value})", use_container_width=True)
-                        else:
-                            st.caption("Enable 'Clean Up' in sidebar to see post-processing")
+                    st.session_state.preview_image = preview_images[0]
+                    if apply_threshold:
+                        processed = process_images([preview_images[0]], threshold=threshold_value, make_transparent=make_transparent)
+                        st.session_state.preview_processed = processed[0]
+                    else:
+                        st.session_state.preview_processed = None
+        
+        # Display persistent preview
+        if st.session_state.preview_image is not None:
+            preview_header_col1, preview_header_col2 = st.columns([4, 1])
+            with preview_header_col1:
+                st.markdown("##### 👁️ Preview")
+            with preview_header_col2:
+                if st.button("🗑️ Clear", key="clear_preview", use_container_width=True):
+                    st.session_state.preview_image = None
+                    st.session_state.preview_processed = None
+                    st.rerun()
+            
+            col_orig, col_proc = st.columns(2)
+            with col_orig:
+                st.image(st.session_state.preview_image, caption="Raw Output", use_container_width=True)
+            with col_proc:
+                if apply_threshold:
+                    # Re-process if threshold settings changed
+                    processed = process_images([st.session_state.preview_image], threshold=threshold_value, make_transparent=make_transparent)
+                    st.image(processed[0], caption=f"After Processing (threshold={threshold_value})", use_container_width=True)
+                else:
+                    st.caption("Enable 'Clean Up' in sidebar to see post-processing")
+        
+        # Initialize cancellation state
+        if 'generation_cancelled' not in st.session_state:
+            st.session_state.generation_cancelled = False
         
         if generate_button and model_loaded and generator is not None:
             st.session_state.generated_images = []
+            st.session_state.generation_cancelled = False
+            
             progress_bar = st.progress(0, text="Starting generation...")
-            status_text = st.empty()
+            status_container = st.container()
+            
+            with status_container:
+                status_col1, status_col2 = st.columns([3, 1])
+                with status_col1:
+                    status_text = st.empty()
+                with status_col2:
+                    cancel_placeholder = st.empty()
+            
+            # Show cancel button during generation
+            cancel_clicked = cancel_placeholder.button("🛑 Cancel", key="cancel_generation", type="secondary", use_container_width=True)
+            
+            if cancel_clicked:
+                st.session_state.generation_cancelled = True
+            
+            # Track images generated for real-time feedback
+            images_generated_count = [0]  # Use list for mutable reference in callback
             
             def update_progress(progress: float) -> None:
-                progress_bar.progress(progress, text=f"Generating signatures... {int(progress * 100)}%")
-                status_text.text(f"Running Inference... {int(progress * 100)}%")
+                if st.session_state.generation_cancelled:
+                    return  # Skip update if cancelled
+                current_count = int(progress * total_samples)
+                images_generated_count[0] = current_count
+                progress_bar.progress(progress, text=f"Generating signatures... {current_count}/{total_samples}")
+                status_text.text(f"🔄 Generated {current_count} of {total_samples} signatures ({int(progress * 100)}%)")
             
             try:
                 total_samples = int(n_signatures * quality_ratio) if use_quality_filter else n_signatures
-                images = generate_signatures_batch(
-                    generator=generator, n_samples=total_samples, latent_dim=latent_dim,
-                    device=device, seed=seed, batch_size=32, progress_callback=update_progress, noise_scale=noise_scale
-                )
                 
-                if use_quality_filter and discriminator is not None:
-                    status_text.text("Scoring signatures...")
-                    scores = []
-                    batch_size = 32
-                    for i in range(0, len(images), batch_size):
-                        batch_imgs = images[i:i+batch_size]
-                        batch_tensors = []
-                        for img in batch_imgs:
-                            img_gray = img.convert('L')
-                            t = torch.from_numpy(np.array(img_gray)).float().unsqueeze(0) / 127.5 - 1.0
-                            batch_tensors.append(t)
-                        batch_input = torch.stack(batch_tensors).to(device)
-                        with torch.no_grad():
-                            batch_scores = discriminator(batch_input).cpu().numpy().flatten()
-                            scores.extend(batch_scores)
+                # Custom batch generation with cancellation support
+                images = []
+                batch_size = 32
+                num_batches = (total_samples + batch_size - 1) // batch_size
+                
+                for batch_idx in range(num_batches):
+                    # Check for cancellation
+                    if st.session_state.generation_cancelled:
+                        cancel_placeholder.empty()
+                        progress_bar.empty()
+                        status_text.warning(f"⚠️ Generation cancelled. Generated {len(images)} of {total_samples} signatures.")
+                        if images:  # Keep what we generated
+                            st.session_state.generated_images = images
+                        break
                     
-                    scored_images = list(zip(images, scores))
-                    scored_images.sort(key=lambda x: x[1], reverse=True)
-                    images = [img for img, score in scored_images[:n_signatures]]
-                    avg_score = np.mean([score for img, score in scored_images[:n_signatures]])
-                    st.info(f"💎 Quality Filter: Kept top {n_signatures} of {total_samples}. Avg Realism Score: {avg_score:.4f}")
-
-                if apply_threshold:
-                    status_text.text("Applying post-processing...")
-                    images = process_images(images, threshold=threshold_value, make_transparent=make_transparent)
-
-                st.session_state.generated_images = images
-                status_text.text("Compressing files...")
-                zip_filename = f"Signatures_{selected_model_name}.zip"
-                image_prefix = f"Signature_{selected_model_name}"
-                zip_data = create_zip_archive(images, prefix=image_prefix)
-                sheet_data = create_contact_sheet(images, cols=4)
+                    current_batch_size = min(batch_size, total_samples - len(images))
+                    batch_images = generate_signatures_batch(
+                        generator=generator, n_samples=current_batch_size, latent_dim=latent_dim,
+                        device=device, seed=seed + batch_idx if seed else None, batch_size=current_batch_size, noise_scale=noise_scale
+                    )
+                    images.extend(batch_images)
+                    
+                    # Update progress
+                    progress = len(images) / total_samples
+                    update_progress(progress)
                 
-                st.session_state.zip_data = zip_data
-                st.session_state.zip_name = zip_filename
-                st.session_state.sheet_data = sheet_data
+                # Hide cancel button after generation
+                cancel_placeholder.empty()
                 
-                progress_bar.progress(1.0, text="Generation complete!")
-                status_text.text("Processing complete!")
-                st.success(f"✅ Generated {len(images)} signatures successfully!")
+                # Skip rest if cancelled
+                if st.session_state.generation_cancelled and not images:
+                    pass  # Nothing to process
+                elif st.session_state.generation_cancelled:
+                    pass  # Already handled above
+                
+                else:
+                    # Normal completion - process images
+                    if use_quality_filter and discriminator is not None:
+                        status_text.text("Scoring signatures...")
+                        scores = []
+                        score_batch_size = 32
+                        for i in range(0, len(images), score_batch_size):
+                            batch_imgs = images[i:i+score_batch_size]
+                            batch_tensors = []
+                            for img in batch_imgs:
+                                img_gray = img.convert('L')
+                                t = torch.from_numpy(np.array(img_gray)).float().unsqueeze(0) / 127.5 - 1.0
+                                batch_tensors.append(t)
+                            batch_input = torch.stack(batch_tensors).to(device)
+                            with torch.no_grad():
+                                batch_scores = discriminator(batch_input).cpu().numpy().flatten()
+                                scores.extend(batch_scores)
+                        
+                        scored_images = list(zip(images, scores))
+                        scored_images.sort(key=lambda x: x[1], reverse=True)
+                        images = [img for img, score in scored_images[:n_signatures]]
+                        avg_score = np.mean([score for img, score in scored_images[:n_signatures]])
+                        st.info(f"💎 Quality Filter: Kept top {n_signatures} of {total_samples}. Avg Realism Score: {avg_score:.4f}")
+
+                    if apply_threshold:
+                        status_text.text("Applying post-processing...")
+                        images = process_images(images, threshold=threshold_value, make_transparent=make_transparent)
+
+                    st.session_state.generated_images = images
+                    status_text.text("Compressing files...")
+                    zip_filename = f"Signatures_{selected_model_name}.zip"
+                    image_prefix = f"Signature_{selected_model_name}"
+                    zip_data = create_zip_archive(images, prefix=image_prefix)
+                    sheet_data = create_contact_sheet(images, cols=4)
+                    
+                    st.session_state.zip_data = zip_data
+                    st.session_state.zip_name = zip_filename
+                    st.session_state.sheet_data = sheet_data
+                    
+                    progress_bar.progress(1.0, text="Generation complete!")
+                    status_text.text("Processing complete!")
+                    st.success(f"✅ Generated {len(images)} signatures successfully!")
                 
             except Exception as e:
                 st.error(f"❌ Generation failed: {str(e)}")
@@ -821,68 +1104,225 @@ def render_generation_page():
         
         if st.session_state.generated_images:
             st.divider()
-            res_col1, res_col2 = st.columns([3, 1])
-            with res_col1:
-                st.subheader("📸 Generated Signatures Gallery")
-            with res_col2:
-                if 'zip_data' in st.session_state and st.session_state.zip_data:
-                    zip_data = st.session_state.zip_data
-                    zip_filename = st.session_state.get('zip_name', f"Signatures_{selected_model_name}.zip")
-                else:
-                    zip_filename = f"Signatures_{selected_model_name}.zip"
-                    image_prefix = f"Signature_{selected_model_name}"
-                    zip_data = create_zip_archive(st.session_state.generated_images, prefix=image_prefix)
-                    
-                st.download_button("📥 Download ZIP", zip_data, zip_filename, "application/zip", use_container_width=True, type="primary")
-                
-                # Contact sheet with customizable columns
-                with st.expander("📄 Contact Sheet Options"):
-                    sheet_cols = st.slider("Columns", 2, 10, 4, key="sheet_cols")
-                    sheet_data = create_contact_sheet(st.session_state.generated_images, cols=sheet_cols)
-                    if sheet_data:
-                        st.download_button("📄 Download Contact Sheet", sheet_data, f"Contact_Sheet_{selected_model_name}.png", "image/png", use_container_width=True)
             
             images = st.session_state.generated_images
             num_images = len(images)
+            
+            # Initialize selection state
+            if 'selected_images' not in st.session_state:
+                st.session_state.selected_images = set()
+            
+            # Header with selection controls
+            res_col1, res_col2, res_col3 = st.columns([2.2, 1, 1])
+            with res_col1:
+                st.markdown("<div class=\"sg-section-title\">📸 Generated Signatures Gallery</div>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class=\"sg-section-sub\">{num_images} images ready • Use Export Options to download, save, or build a contact sheet.</div>",
+                    unsafe_allow_html=True,
+                )
+            with res_col2:
+                selection_mode = st.checkbox("☑️ Selection Mode", value=False, help="Enable to select specific images for download")
+            with res_col3:
+                if selection_mode:
+                    sel_subcol1, sel_subcol2 = st.columns(2)
+                    with sel_subcol1:
+                        if st.button("Select All", use_container_width=True, key="select_all"):
+                            st.session_state.selected_images = set(range(num_images))
+                            st.rerun()
+                    with sel_subcol2:
+                        if st.button("Clear All", use_container_width=True, key="clear_selection"):
+                            st.session_state.selected_images = set()
+                            st.rerun()
+            
+            # Export Options expander
+            with st.expander("📤 Export Options", expanded=True):
+                st.markdown(
+                    """<div class="sg-section-sub" style="margin-top:-0.25rem;">
+                    Choose format + naming, then download everything (or only your selection).
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+                exp_col1, exp_col2, exp_col3 = st.columns([1.2, 1.6, 1.2])
+                
+                with exp_col1:
+                    export_format = st.selectbox(
+                        "Format",
+                        options=["PNG", "JPEG"],
+                        index=0,
+                        help="PNG for transparency support, JPEG for smaller file size"
+                    )
+                    if export_format == "JPEG":
+                        jpeg_quality = st.slider("JPEG Quality", 50, 100, 90, 5)
+                    else:
+                        jpeg_quality = 95
+                
+                with exp_col2:
+                    filename_prefix = st.text_input(
+                        "Filename Prefix",
+                        value=selected_model_name,
+                        help="Prefix for generated filenames"
+                    )
+                    filename_template = st.text_input(
+                        "Filename Template",
+                        value="{prefix}_{index:03d}",
+                        help="Template: {prefix}, {index}, {total}"
+                    )
+                
+                with exp_col3:
+                    st.markdown("**Quick Download**")
+                    # Determine what to download
+                    selected_list = sorted(st.session_state.selected_images) if selection_mode and st.session_state.selected_images else None
+                    download_count = len(selected_list) if selected_list else num_images
+                    
+                    zip_data = create_zip_archive(
+                        images,
+                        prefix=filename_prefix,
+                        format=export_format,
+                        quality=jpeg_quality,
+                        selected_indices=selected_list,
+                        filename_template=filename_template
+                    )
+                    ext = "jpg" if export_format == "JPEG" else "png"
+                    zip_filename = f"Signatures_{filename_prefix}.zip"
+                    
+                    btn_label = f"📥 Download {download_count} images" if selection_mode and selected_list else "📥 Download All"
+                    st.download_button(
+                        btn_label,
+                        zip_data,
+                        zip_filename,
+                        "application/zip",
+                        use_container_width=True,
+                        type="primary"
+                    )
+                
+                # Save to Folder section
+                st.markdown("---")
+                save_col1, save_col2 = st.columns([3, 1])
+                with save_col1:
+                    if "default_save_folder" not in st.session_state:
+                        st.session_state.default_save_folder = str(
+                            DEFAULT_SAMPLE_DIR / f"generated_{time.strftime('%Y%m%d_%H%M%S')}"
+                        )
+                    save_folder = st.text_input(
+                        "💾 Save to Folder",
+                        value=st.session_state.default_save_folder,
+                        help="Enter a folder path to save images directly to disk"
+                    )
+                with save_col2:
+                    st.markdown("<br>", unsafe_allow_html=True)  # Spacing
+                    if st.button("💾 Save to Disk", use_container_width=True, type="secondary"):
+                        try:
+                            saved_count, saved_path = save_images_to_folder(
+                                images,
+                                save_folder,
+                                prefix=filename_prefix,
+                                format=export_format,
+                                quality=jpeg_quality,
+                                selected_indices=selected_list,
+                                filename_template=filename_template
+                            )
+                            st.success(f"✅ Saved {saved_count} images to: `{saved_path}`")
+                        except Exception as e:
+                            st.error(f"❌ Failed to save: {str(e)}")
+                
+                # Contact sheet (no nested expander to avoid Streamlit nesting error)
+                st.markdown("**📄 Contact Sheet**")
+                sheet_cols = st.slider("Columns", 2, 10, 4, key="sheet_cols")
+                sheet_images = [images[i] for i in sorted(st.session_state.selected_images)] if selection_mode and st.session_state.selected_images else images
+                sheet_data = create_contact_sheet(sheet_images, cols=sheet_cols)
+                if sheet_data:
+                    st.download_button("📄 Download Contact Sheet", sheet_data, f"Contact_Sheet_{filename_prefix}.png", "image/png", use_container_width=True)
+            
+            # Selection info bar
+            if selection_mode and st.session_state.selected_images:
+                st.info(f"📌 Selected: {len(st.session_state.selected_images)} of {num_images} images")
             
             # Pagination controls
             IMAGES_PER_PAGE = 24
             total_pages = (num_images + IMAGES_PER_PAGE - 1) // IMAGES_PER_PAGE
             
+            # Initialize page in session state
+            if 'gallery_current_page' not in st.session_state:
+                st.session_state.gallery_current_page = 1
+            
+            # Ensure page is within bounds
+            if st.session_state.gallery_current_page > total_pages:
+                st.session_state.gallery_current_page = 1
+            
+            current_page = st.session_state.gallery_current_page
+            
             if total_pages > 1:
                 page_col1, page_col2, page_col3 = st.columns([1, 2, 1])
+                
+                with page_col1:
+                    prev_disabled = current_page <= 1
+                    if st.button("⬅️ Previous", disabled=prev_disabled, use_container_width=True, key="prev_page"):
+                        st.session_state.gallery_current_page = max(1, current_page - 1)
+                        st.rerun()
+                
                 with page_col2:
-                    current_page = st.selectbox(
-                        f"Page (Total: {num_images} images)",
-                        options=list(range(1, total_pages + 1)),
-                        format_func=lambda x: f"Page {x} of {total_pages} (images {(x-1)*IMAGES_PER_PAGE + 1}-{min(x*IMAGES_PER_PAGE, num_images)})",
-                        key="gallery_page"
+                    start_img = (current_page - 1) * IMAGES_PER_PAGE + 1
+                    end_img = min(current_page * IMAGES_PER_PAGE, num_images)
+                    st.markdown(
+                        f"<div style='text-align: center; padding: 8px;'>"
+                        f"<strong>Page {current_page} of {total_pages}</strong><br/>"
+                        f"<small>Images {start_img}-{end_img} of {num_images}</small>"
+                        f"</div>",
+                        unsafe_allow_html=True
                     )
-            else:
-                current_page = 1
+                
+                with page_col3:
+                    next_disabled = current_page >= total_pages
+                    if st.button("Next ➡️", disabled=next_disabled, use_container_width=True, key="next_page"):
+                        st.session_state.gallery_current_page = min(total_pages, current_page + 1)
+                        st.rerun()
             
             # Get images for current page
             start_idx = (current_page - 1) * IMAGES_PER_PAGE
             end_idx = min(start_idx + IMAGES_PER_PAGE, num_images)
             display_images = images[start_idx:end_idx]
             
-            # Display grid with click-to-download
+            # Display grid with selection or download
             num_cols = 6 if len(display_images) > 12 else (4 if len(display_images) > 4 else max(len(display_images), 1))
             cols = st.columns(num_cols)
             for idx, img in enumerate(display_images):
                 actual_idx = start_idx + idx
                 with cols[idx % num_cols]:
-                    st.image(img, caption=f"#{actual_idx + 1}", use_container_width=True)
-                    # Individual download button
-                    img_buf = io.BytesIO()
-                    img.save(img_buf, format="PNG")
-                    st.download_button(
-                        "💾", img_buf.getvalue(),
-                        f"{selected_model_name}_{actual_idx + 1:03d}.png",
-                        "image/png",
-                        key=f"dl_{actual_idx}",
-                        use_container_width=True
-                    )
+                    # Show selection indicator
+                    is_selected = actual_idx in st.session_state.selected_images
+                    if selection_mode and is_selected:
+                        st.markdown("<div class=\"sg-selected-pill\">Selected ✓</div>", unsafe_allow_html=True)
+                    
+                    st.image(img, caption=f"#{actual_idx + 1}" + (" ✓" if is_selected else ""), use_container_width=True)
+                    
+                    if selection_mode:
+                        # Toggle selection checkbox
+                        if st.checkbox(
+                            "Select", 
+                            value=is_selected, 
+                            key=f"sel_{actual_idx}",
+                            label_visibility="collapsed"
+                        ):
+                            st.session_state.selected_images.add(actual_idx)
+                        else:
+                            st.session_state.selected_images.discard(actual_idx)
+                    else:
+                        # Individual download button
+                        img_buf = io.BytesIO()
+                        if export_format == "JPEG":
+                            rgb_img = img.convert("RGB") if img.mode != "RGB" else img
+                            rgb_img.save(img_buf, format="JPEG", quality=jpeg_quality)
+                        else:
+                            img.save(img_buf, format="PNG")
+                        st.download_button(
+                            "📥 Save", img_buf.getvalue(),
+                            f"{filename_prefix}_{actual_idx + 1:03d}.{ext}",
+                            f"image/{export_format.lower()}",
+                            key=f"dl_{actual_idx}",
+                            use_container_width=True,
+                            type="secondary"
+                        )
 
     with tab_morph:
         st.subheader("🧬 Latent Space Morphing")
@@ -1108,7 +1548,11 @@ def render_training_page():
         })
 
         st.markdown("### Run")
-        run_name = st.text_input("Run Name", value=_new_run_id(prefix="train"))
+        # Generate a default run name only once per session to prevent it from changing on every rerun
+        if "default_run_name" not in st.session_state:
+            st.session_state.default_run_name = _new_run_id(prefix="train")
+            
+        run_name = st.text_input("Run Name", value=st.session_state.default_run_name)
         resume_training = st.checkbox("Resume from checkpoint", value=False)
 
         run_dirs = _list_runs(DEFAULT_RUNS_DIR)
@@ -1605,18 +2049,89 @@ def main() -> None:
         page_icon="✍️",
         layout="wide"
     )
-    
-    # Custom CSS
-    st.markdown("""
-        <style>
-        div[data-testid="stImage"] {
-            background-color: white;
-            padding: 10px;
-            border: 1px solid #e0e0e0;
-            border-radius: 5px;
-        }
-        </style>
-    """, unsafe_allow_html=True)
+
+    # Custom CSS (global)
+    st.markdown(
+        """
+                <style>
+                    /* Layout + typography */
+                    .block-container { padding-top: 1.25rem; padding-bottom: 2.5rem; }
+                    .stApp { background: var(--background-color); }
+
+                    /* Hero */
+                    .sg-hero {
+                        padding: 1.0rem 1.1rem;
+                        border-radius: 14px;
+                        border: 1px solid rgba(255,255,255,0.08);
+                        background: rgba(255,255,255,0.03);
+                        margin-bottom: 0.8rem;
+                    }
+                    .sg-hero-title { font-size: 1.65rem; font-weight: 750; line-height: 1.1; }
+                    .sg-hero-sub { margin-top: 0.35rem; opacity: 0.85; font-size: 0.95rem; }
+
+                    /* Section titles */
+                    .sg-section-title { font-size: 1.15rem; font-weight: 700; margin-top: 0.35rem; }
+                    .sg-section-sub { opacity: 0.78; margin-top: 0.2rem; margin-bottom: 0.6rem; }
+
+                    /* Banners */
+                    .sg-banner {
+                        padding: 0.75rem 0.9rem;
+                        border-radius: 12px;
+                        border: 1px solid rgba(255,255,255,0.08);
+                        background: rgba(255,255,255,0.03);
+                        margin: 0.75rem 0 0.25rem 0;
+                    }
+                    .sg-banner.ok { border-left: 4px solid var(--primary-color); }
+                    .sg-banner.warn { border-left: 4px solid rgba(255,255,255,0.25); }
+                    .sg-banner-title { font-weight: 700; }
+                    .sg-banner-sub { opacity: 0.82; font-size: 0.92rem; margin-top: 0.15rem; }
+
+                    /* Images */
+                    div[data-testid="stImage"] {
+                        background-color: #ffffff;
+                        padding: 12px;
+                        border: 1px solid rgba(0,0,0,0.08);
+                        border-radius: 12px;
+                        box-shadow: 0 6px 18px rgba(0,0,0,0.18);
+                    }
+                    div[data-testid="stImage"] img { border-radius: 8px; }
+
+                    /* Expanders */
+                    details[data-testid="stExpander"] {
+                        border-radius: 12px;
+                        border: 1px solid rgba(255,255,255,0.08);
+                        background: rgba(255,255,255,0.02);
+                    }
+
+                    /* Tabs: slightly bolder active state */
+                    button[data-baseweb="tab"] { font-weight: 600; }
+                    button[data-baseweb="tab"][aria-selected="true"] {
+                        border-bottom: 2px solid var(--primary-color) !important;
+                    }
+
+                    /* Buttons: rounder + consistent height */
+                    button[kind], div[data-testid="stDownloadButton"] button {
+                        border-radius: 12px !important;
+                    }
+                    div[data-testid="stDownloadButton"] button, div[data-testid="stButton"] button {
+                        min-height: 42px;
+                    }
+
+                    /* Selected pill */
+                    .sg-selected-pill {
+                        display: inline-block;
+                        padding: 0.15rem 0.5rem;
+                        border-radius: 999px;
+                        font-size: 0.78rem;
+                        font-weight: 650;
+                        margin-bottom: 0.35rem;
+                        border: 1px solid rgba(255,255,255,0.12);
+                        background: rgba(255,255,255,0.05);
+                    }
+                </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     # Navigation
     with st.sidebar:
